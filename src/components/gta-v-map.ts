@@ -342,7 +342,8 @@ export class GtaVMap extends LitElement {
   }
 
   private _initMap(): void {
-    if (this._map) return;
+    // Lit and stylesheet callbacks can complete after the host has been removed.
+    if (this._map || !this.isConnected) return;
 
     const container = this.renderRoot.querySelector<HTMLElement>('#map-container');
     if (!container) return;
