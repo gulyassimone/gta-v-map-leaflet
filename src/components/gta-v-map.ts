@@ -3,9 +3,10 @@ import { customElement, property } from 'lit/decorators.js';
 import L from 'leaflet';
 import 'leaflet.markercluster';
 import 'leaflet.heat';
+import leafletCss from 'leaflet/dist/leaflet.css?inline';
 import markerClusterCss from 'leaflet.markercluster/dist/MarkerCluster.css?inline';
 import markerClusterDefaultCss from 'leaflet.markercluster/dist/MarkerCluster.Default.css?inline';
-import { createGtaCRS, generateId, upsertMarkerEntry, updateLeafletMarker, DEFAULT_MARKER_GROUP } from '../utils/index.js';
+import { createGtaCRS, upsertMarkerEntry, updateLeafletMarker } from '../utils/index.js';
 import { upsertShapeEntry, computeCentroid, createLabelIcon } from '../utils/shape.utils.js';
 import {
   WATER_COLOR,
@@ -43,6 +44,7 @@ import { gtaVMapStyles } from './gta-v-map.styles.js';
 export class GtaVMap extends LitElement {
   static override readonly styles = [
     gtaVMapStyles,
+    unsafeCSS(leafletCss),
     unsafeCSS(markerClusterCss),
     unsafeCSS(markerClusterDefaultCss),
   ];
@@ -51,7 +53,18 @@ export class GtaVMap extends LitElement {
 
   /** URL to the Leaflet CSS stylesheet. Override to use a local copy. */
   @property({ type: String, attribute: 'leaflet-css-url' })
-  leafletCssUrl = 'https://unpkg.com/leaflet@1.7.1/dist/leaflet.css';
+  leafletCssUrl = '';
+
+  /** Single raster map, positioned using GTA coordinates instead of tiles. */
+  @property({ type: String, attribute: 'image-url' })
+  imageUrl = '';
+
+  /** Southwest/northeast corners in [y, x] game units. */
+  @property({ type: Array, attribute: 'image-bounds' })
+  imageBounds: LatLngBoundsTuple = [[-4058.536585365854, -5661.196911196911], [8429.268292682927, 6694.980694980695]];
+
+  @property({ type: Boolean, attribute: 'hide-zoom-control' })
+  hideZoomControl = false;
 
   // --- Custom CRS (property only, set via JS) ---
 
@@ -118,6 +131,10 @@ export class GtaVMap extends LitElement {
   @property({ type: String, attribute: 'blips-url' })
   blipsUrl: string = DEFAULT_MAP_CONFIG.blipsUrl;
 
+  /** File extension for consumer-supplied blip icons. */
+  @property({ type: String, attribute: 'blip-extension' })
+  blipExtension = 'png';
+
   // --- Layer control ---
 
   /** When true, displays a Leaflet layer control for toggling base layers and overlays. */
@@ -157,6 +174,9 @@ export class GtaVMap extends LitElement {
   // --- Internal state ---
 
   private _map?: L.Map;
+  private _imageLayer?: L.ImageOverlay;
+  private _resizeObserver?: ResizeObserver;
+  private readonly _declarativeIds = new Set<string>();
   private readonly _markerEntries: GtaMarkerEntry[] = [];
   private readonly _shapeEntries: GtaShapeEntry[] = [];
   private readonly _overlayGroups = new Map<string, L.LayerGroup | L.MarkerClusterGroup>();
@@ -303,7 +323,7 @@ export class GtaVMap extends LitElement {
 
   override render() {
     return html`
-      <link rel="stylesheet" href="${this.leafletCssUrl}" @load=${this._onCssLoad}>
+      ${this.leafletCssUrl ? html`<link rel="stylesheet" href="${this.leafletCssUrl}" @load=${this._onCssLoad}>` : null}
       <div id="map-container"></div>
     `;
   }
@@ -316,7 +336,7 @@ export class GtaVMap extends LitElement {
 
   override firstUpdated(): void {
     const link = this.renderRoot.querySelector<HTMLLinkElement>('link');
-    if (link?.sheet) {
+    if (!this.leafletCssUrl || link?.sheet) {
       this._initMap();
     }
   }
@@ -328,7 +348,7 @@ export class GtaVMap extends LitElement {
     if (!container) return;
 
     const crs = this._crs ?? createGtaCRS();
-    this._buildTileLayers();
+    if (!this.imageUrl) this._buildTileLayers();
 
     const defaultLayer = this._tileLayers[this.defaultStyle] ?? this._tileLayers.satellite;
 
@@ -337,7 +357,12 @@ export class GtaVMap extends LitElement {
       minZoom: this.minZoom,
       maxZoom: this.maxZoom,
       preferCanvas: true,
-      layers: [defaultLayer],
+      layers: this.imageUrl ? [] : [defaultLayer],
+      zoomControl: !this.hideZoomControl,
+      // Hosts may replace the element immediately after a zoom action.
+      // Leaflet's delayed zoom transition can otherwise run after map.remove().
+      zoomAnimation: false,
+      zoomSnap: 0.25,
       center: DEFAULT_MAP_CONFIG.center,
       zoom: this.zoom,
     };
@@ -352,6 +377,12 @@ export class GtaVMap extends LitElement {
 
     this._map = L.map(container, mapOptions);
     this._map.getContainer().style.background = WATER_COLOR;
+    if (this.imageUrl) {
+      this._imageLayer = L.imageOverlay(this.imageUrl, this.imageBounds).addTo(this._map);
+      this.resetView();
+    }
+    this._resizeObserver = new ResizeObserver(() => this._map?.invalidateSize());
+    this._resizeObserver.observe(container);
 
     requestAnimationFrame(() => {
       this._map?.invalidateSize();
@@ -372,8 +403,45 @@ export class GtaVMap extends LitElement {
     this._dispatch<MapReadyDetail>('map-ready', { map: this._map });
   }
 
+  /** Fit the complete raster image, or reset the tile map to its initial view. */
+  resetView(): void {
+    if (this.imageUrl) this._map?.fitBounds(this.imageBounds, { animate: false });
+    else this._map?.setView(DEFAULT_MAP_CONFIG.center, this.zoom);
+  }
+
+  /** Change the current zoom using the consumer's controls. */
+  changeZoom(delta: number): void {
+    if (this._map) this._map.setZoom(this._map.getZoom() + delta);
+  }
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    if (this.hasUpdated) void this.updateComplete.then(() => {
+      if (this.isConnected) this._initMap();
+    });
+  }
+
+  override disconnectedCallback(): void {
+    this._resizeObserver?.disconnect();
+    this._map?.remove();
+    this._map = undefined;
+    this._imageLayer = undefined;
+    this._layerControl = undefined;
+    this._heatLayer = undefined;
+    this._overlayGroups.clear();
+    for (const entry of this._markerEntries) entry._leaflet = undefined;
+    for (const entry of this._shapeEntries) {
+      entry._leaflet = undefined;
+      entry._labelMarker = undefined;
+    }
+    super.disconnectedCallback();
+  }
+
   override updated(changed: PropertyValues): void {
     if (!this._map) return;
+    if (this._imageLayer && (changed.has('imageUrl') || changed.has('imageBounds'))) {
+      this._imageLayer.setUrl(this.imageUrl).setBounds(L.latLngBounds(this.imageBounds));
+    }
 
     if (changed.has('markers')) {
       this._syncMarkers();
@@ -497,7 +565,7 @@ export class GtaVMap extends LitElement {
     if (this._layerControl || !this._map) return;
 
     const baseLayers: Record<string, L.TileLayer> = {};
-    for (const style of MAP_STYLES) {
+    for (const style of this.imageUrl ? [] : MAP_STYLES) {
       baseLayers[STYLE_LABELS[style]] = this._tileLayers[style];
     }
 
@@ -539,10 +607,10 @@ export class GtaVMap extends LitElement {
 
   private _createIcon(iconNum: number): L.Icon {
     return L.icon({
-      iconUrl: `${this.blipsUrl}/${iconNum}.png`,
+      iconUrl: `${this.blipsUrl}/${iconNum}.${this.blipExtension}`,
       iconSize: [20, 20],
-      iconAnchor: [20, 20],
-      popupAnchor: [-10, -27],
+      iconAnchor: [10, 10],
+      popupAnchor: [0, -12],
     });
   }
 
@@ -571,30 +639,14 @@ export class GtaVMap extends LitElement {
   }
 
   private _syncMarkers(): void {
-    // Clear only marker leaflet refs from groups
+    // Declarative markers share the same registry as imperative markers.
+    for (const id of this._declarativeIds) this.removeMarker(id);
+    this._declarativeIds.clear();
     for (const entry of this._markerEntries) {
-      if (entry._leaflet) {
-        const group = this._overlayGroups.get(entry.group);
-        if (group) group.removeLayer(entry._leaflet);
-      }
-      entry._leaflet = undefined;
+      if (!entry._leaflet) this._addLeafletMarker(entry);
     }
-
-    // Rebuild declarative markers
     const parsed = typeof this.markers === 'string' ? JSON.parse(this.markers) as GtaMarker[] : this.markers;
-    const declarativeEntries: GtaMarkerEntry[] = [];
-    for (const marker of parsed) {
-      const id = marker.id ?? generateId();
-      const group = marker.group ?? DEFAULT_MARKER_GROUP;
-      const entry: GtaMarkerEntry = { ...marker, id, group };
-      declarativeEntries.push(entry);
-      this._addLeafletMarker(entry);
-    }
-
-    // Re-add imperative markers
-    for (const entry of this._markerEntries) {
-      this._addLeafletMarker(entry);
-    }
+    for (const marker of parsed) this._declarativeIds.add(this.addMarker(marker));
   }
 
   // --- Private: Shapes ---
@@ -658,11 +710,7 @@ export class GtaVMap extends LitElement {
   // --- Private: Heatmap ---
 
   private _getHeatmapData(): [number, number][] {
-    const parsed = typeof this.markers === 'string' ? JSON.parse(this.markers) as GtaMarker[] : this.markers;
-    const allMarkers = [
-      ...parsed,
-      ...this._markerEntries,
-    ];
+    const allMarkers = this._markerEntries;
     return allMarkers.map((m) => [m.y, m.x]);
   }
 

@@ -6,6 +6,10 @@ declare global {
       'gta-v-map': React.DetailedHTMLProps<React.HTMLAttributes<GtaVMap>, GtaVMap> & {
         zoom?: string | number;
         'default-style'?: string;
+        'image-url'?: string;
+        'image-bounds'?: string;
+        'blip-extension'?: string;
+        'hide-zoom-control'?: boolean;
         'tile-base-url'?: string;
         'blips-url'?: string;
         'show-layer-control'?: boolean;
